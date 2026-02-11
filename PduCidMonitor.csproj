@@ -12,5 +12,4 @@
 			<HintPath>C:\Program Files (x86)\Kvaser\Canlib\dotnet\net6.0\Kvaser.CanLib.dll</HintPath>
 		</Reference>
 	</ItemGroup>
-
 </Project>
