@@ -1,176 +1,315 @@
 ﻿// Program.cs
-using Kvaser.CanLib;
+using System.Net;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 
-Canlib.canInitializeLibrary();
-int handle = Canlib.canOpenChannel(0, Canlib.canOPEN_ACCEPT_VIRTUAL);
-if (handle < 0)
+var pduState = new Dictionary<string, object>();
+var wsClients = new List<WebSocket>();
+var wsLock = new object();
+
+// ── 가상 데이터 ──
+int batt1V = 0, batt2V = 0, totalV = 0;
+short batt1A = 0, batt2A = 0;
+int batS = 0, batPPC = 0, batPNC = 0, batPC = 0, batNC = 0, batPP = 0;
+int dcP = 0, dcN = 0, obcR = 0, ldcR = 0, invR = 0;
+double dcOutV = 0, dcOutA = 0, obcV = 0, obcA = 0;
+int dcTemp = -40, obcTemp = -40, dcWork = 0;
+int acVr = 0, acVs = 0, acVt = 0;
+string currentMode = "대기";
+
+// ── HTTP + WebSocket 서버 ──
+var http = new HttpListener();
+http.Prefixes.Add("http://localhost:5000/");
+http.Start();
+Console.WriteLine("웹서버 시작: http://localhost:5000/");
+Console.WriteLine();
+Console.WriteLine("=== 가상 테스트 모드 ===");
+Console.WriteLine("  1: 직렬 연결 (700V)");
+Console.WriteLine("  2: 병렬 연결 (350V)");
+Console.WriteLine("  3: OBC 충전");
+Console.WriteLine("  4: DC 급속충전");
+Console.WriteLine("  5: LDC 구동");
+Console.WriteLine("  6: 인버터 구동");
+Console.WriteLine("  0: 전부 OFF (대기)");
+Console.WriteLine("========================");
+
+System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
 {
-    Console.WriteLine($"CAN 채널 열기 실패: {handle}");
-    Console.ReadKey();
-    return;
-}
-Canlib.canSetBusParams(handle, Canlib.canBITRATE_500K, 0, 0, 0, 0);
-Canlib.canBusOn(handle);
+    FileName = "http://localhost:5000",
+    UseShellExecute = true
+});
 
-var latestData = new Dictionary<uint, byte[]>();
-var msgCount = new Dictionary<uint, int>();
-DateTime lastPrint = DateTime.MinValue;
+// HTTP 처리
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        var ctx = await http.GetContextAsync();
 
+        if (ctx.Request.IsWebSocketRequest)
+        {
+            var wsCtx = await ctx.AcceptWebSocketAsync(null);
+            lock (wsLock) wsClients.Add(wsCtx.WebSocket);
+
+            _ = Task.Run(async () =>
+            {
+                var buf = new byte[1024];
+                try
+                {
+                    while (wsCtx.WebSocket.State == WebSocketState.Open)
+                        await wsCtx.WebSocket.ReceiveAsync(buf, CancellationToken.None);
+                }
+                catch { }
+                finally { lock (wsLock) wsClients.Remove(wsCtx.WebSocket); }
+            });
+        }
+        else
+        {
+            string path = ctx.Request.Url!.AbsolutePath;
+            if (path == "/") path = "/index.html";
+            string filePath = Path.Combine(AppContext.BaseDirectory, "wwwroot" + path.Replace('/', Path.DirectorySeparatorChar));
+
+            if (File.Exists(filePath))
+            {
+                byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
+                string ext = Path.GetExtension(filePath).ToLower();
+                ctx.Response.ContentType = ext switch
+                {
+                    ".html" => "text/html; charset=utf-8",
+                    ".css" => "text/css; charset=utf-8",
+                    ".js" => "application/javascript; charset=utf-8",
+                    _ => "application/octet-stream"
+                };
+                ctx.Response.ContentLength64 = fileBytes.Length;
+                await ctx.Response.OutputStream.WriteAsync(fileBytes);
+            }
+            else { ctx.Response.StatusCode = 404; }
+            ctx.Response.Close();
+        }
+    }
+});
+
+// ── 키보드 입력 스레드 ──
+_ = Task.Run(() =>
+{
+    while (true)
+    {
+        var key = Console.ReadKey(true);
+        switch (key.KeyChar)
+        {
+            case '0': // 전부 OFF
+                batt1V = 0; batt2V = 0; totalV = 0;
+                batt1A = 0; batt2A = 0;
+                batS = 0; batPPC = 0; batPNC = 0; batPC = 0; batNC = 0; batPP = 0;
+                dcP = 0; dcN = 0; obcR = 0; ldcR = 0; invR = 0;
+                dcOutV = 0; dcOutA = 0; obcV = 0; obcA = 0;
+                dcTemp = -40; obcTemp = -40; dcWork = 0;
+                acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "대기";
+                Console.WriteLine("  → [0] 전부 OFF");
+                break;
+
+            case '1': // 직렬 700V
+                batt1V = 350; batt2V = 350; totalV = 700;
+                batt1A = 10; batt2A = 10;
+                batS = 1; batPC = 1; batNC = 1;
+                batPPC = 0; batPNC = 0; batPP = 0;
+                dcP = 0; dcN = 0; obcR = 0; ldcR = 0; invR = 0;
+                dcOutV = 0; dcOutA = 0; obcV = 0; obcA = 0;
+                dcWork = 0; acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "직렬 연결 (700V)";
+                Console.WriteLine("  → [1] 직렬 연결 700V");
+                break;
+
+            case '2': // 병렬 350V
+                batt1V = 350; batt2V = 350; totalV = 350;
+                batt1A = 20; batt2A = 20;
+                batPPC = 1; batPNC = 1; batPP = 1;
+                batS = 0; batPC = 0; batNC = 0;
+                dcP = 0; dcN = 0; obcR = 0; ldcR = 0; invR = 0;
+                dcOutV = 0; dcOutA = 0; obcV = 0; obcA = 0;
+                dcWork = 0; acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "병렬 연결 (350V)";
+                Console.WriteLine("  → [2] 병렬 연결 350V");
+                break;
+
+            case '3': // OBC 충전
+                batt1V = 350; batt2V = 350; totalV = 700;
+                batt1A = -15; batt2A = -15;
+                batS = 1; batPC = 1; batNC = 1; obcR = 1;
+                batPPC = 0; batPNC = 0; batPP = 0;
+                dcP = 0; dcN = 0; ldcR = 0; invR = 0;
+                obcV = 700; obcA = 15;
+                obcTemp = 45;
+                acVr = 220; acVs = 220; acVt = 220;
+                dcOutV = 0; dcOutA = 0; dcWork = 0;
+                currentMode = "OBC 충전 중";
+                Console.WriteLine("  → [3] OBC 충전 모드");
+                break;
+
+            case '4': // DC 급속충전
+                batt1V = 350; batt2V = 350; totalV = 700;
+                batt1A = -50; batt2A = -50;
+                batS = 1; batPC = 1; batNC = 1; dcP = 1; dcN = 1;
+                batPPC = 0; batPNC = 0; batPP = 0;
+                obcR = 0; ldcR = 0; invR = 0;
+                obcV = 0; obcA = 0;
+                dcOutV = 0; dcOutA = 0; dcWork = 0;
+                acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "DC 급속충전 중";
+                Console.WriteLine("  → [4] DC 급속충전");
+                break;
+
+            case '5': // LDC 구동
+                batt1V = 350; batt2V = 350; totalV = 350;
+                batt1A = 5; batt2A = 5;
+                batPPC = 1; batPNC = 1; batPP = 1; ldcR = 1;
+                batS = 0; batPC = 0; batNC = 0;
+                dcP = 0; dcN = 0; obcR = 0; invR = 0;
+                dcOutV = 13.8; dcOutA = 30;
+                dcTemp = 55; dcWork = 1;
+                obcV = 0; obcA = 0; acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "LDC 구동 중";
+                Console.WriteLine("  → [5] LDC 구동");
+                break;
+
+            case '6': // 인버터
+                batt1V = 350; batt2V = 350; totalV = 700;
+                batt1A = 100; batt2A = 100;
+                batS = 1; batPC = 1; batNC = 1; invR = 1;
+                batPPC = 0; batPNC = 0; batPP = 0;
+                dcP = 0; dcN = 0; obcR = 0; ldcR = 0;
+                dcOutV = 0; dcOutA = 0; dcWork = 0;
+                obcV = 0; obcA = 0; acVr = 0; acVs = 0; acVt = 0;
+                currentMode = "인버터 구동 중";
+                Console.WriteLine("  → [6] 인버터 구동");
+                break;
+        }
+    }
+});
+
+// ── 메인 브로드캐스트 루프 ──
 while (true)
 {
-    byte[] data = new byte[8];
-    int id = 0, dlc = 0, flags = 0;
-    long timestamp = 0;
+    Thread.Sleep(500);
 
-    var status = Canlib.canRead(handle, out id, data, out dlc, out flags, out timestamp);
+    pduState.Clear();
+    pduState["timestamp"] = DateTime.Now.ToString("HH:mm:ss.fff");
 
-    if (status == Canlib.canStatus.canOK)
+    // PDU_Status1
+    var s1 = new Dictionary<string, object>
     {
-        uint uid = (uint)id;
-        latestData[uid] = (byte[])data.Clone();
-        if (!msgCount.ContainsKey(uid)) msgCount[uid] = 0;
-        msgCount[uid]++;
-    }
+        ["name"] = "PDU_Status1 (배터리 전압)",
+        ["raw"] = "가상 데이터",
+        ["count"] = 0,
+        ["Batt1_Voltage"] = batt1V,
+        ["Batt2_Voltage"] = batt2V,
+        ["TotalBatt_Voltage"] = totalV
+    };
+    pduState["0x18FFFF10"] = s1;
 
-    if ((DateTime.Now - lastPrint).TotalMilliseconds >= 1000)
+    // PDU_Status2
+    var s2 = new Dictionary<string, object>
     {
-        lastPrint = DateTime.Now;
-        Console.SetCursorPosition(0, 0);
-        Console.WriteLine("=== PDU CID 전체 CAN 모니터 ===                              ");
-        Console.WriteLine();
+        ["name"] = "PDU_Status2 (배터리 전류, 릴레이)",
+        ["raw"] = "가상 데이터",
+        ["count"] = 0,
+        ["Batt1_Current"] = (int)batt1A,
+        ["Batt2_Current"] = (int)batt2A,
+        ["BAT_S_RELAY"] = batS,
+        ["BAT_PPC_RELAY"] = batPPC,
+        ["BAT_PNC_RELAY"] = batPNC,
+        ["BAT_PC_RELAY"] = batPC,
+        ["BAT_NC_RELAY"] = batNC,
+        ["BAT_PP_RELAY"] = batPP,
+        ["DC_P_RELAY"] = dcP,
+        ["DC_N_RELAY"] = dcN,
+        ["OBC_RELAY"] = obcR,
+        ["LDC_RELAY"] = ldcR,
+        ["INV_RELAY"] = invR
+    };
+    pduState["0x18FFFF20"] = s2;
 
-        foreach (var kvp in latestData.OrderBy(x => x.Key))
+    // DCDC_VCU
+    var dc = new Dictionary<string, object>
+    {
+        ["name"] = "DCDC_VCU (LDC 상태)",
+        ["raw"] = "가상 데이터",
+        ["count"] = 0,
+        ["DC_Output_Vol"] = dcOutV,
+        ["DC_Output_Cur"] = dcOutA,
+        ["DC_Temp"] = dcTemp,
+        ["DC_WorKStart"] = dcWork,
+        ["DC_Err_Temp"] = 0,
+        ["DC_ERR_IOUTO"] = 0,
+        ["DC_ERR_VOUTO"] = 0,
+        ["DC_ERR_VOUTU"] = 0,
+        ["DC_ERR_VINV"] = 0,
+        ["DC_ERR_VINU"] = 0,
+        ["DC_ERR_OUT_SHORT"] = 0,
+        ["DC_ERR_Hardware"] = 0,
+        ["DC_CAN_OVERTIME"] = 0
+    };
+    pduState["0x1801E5F5"] = dc;
+
+    // OBC_BMS_STATE1
+    var obc1 = new Dictionary<string, object>
+    {
+        ["name"] = "OBC_BMS_STATE1 (OBC 상태)",
+        ["raw"] = "가상 데이터",
+        ["count"] = 0,
+        ["OBC_ChargerVoltage"] = obcV,
+        ["OBC_ChargerCurrent"] = obcA,
+        ["OBC_Temperature"] = obcTemp,
+        ["OBC_SoftVersion"] = 1,
+        ["OBC_HardwareVersion"] = 1,
+        ["OBC_TempAnomaly"] = 0,
+        ["OBC_ACVoltageAnomaly"] = 0,
+        ["OBC_StartStatus1"] = 0,
+        ["OBC_ComOvertime"] = 0,
+        ["OBC_BatteryConnectStatus"] = 0,
+        ["OBC_Slave1StartStatus"] = 0,
+        ["OBC_Slave2StartStatus"] = 0,
+        ["OBC_Slave3StartStatus"] = 0
+    };
+    pduState["0x18FF50E5"] = obc1;
+
+    // OBC_BMS_STATE2
+    var obc2 = new Dictionary<string, object>
+    {
+        ["name"] = "OBC_BMS_STATE2 (AC 입력)",
+        ["raw"] = "가상 데이터",
+        ["count"] = 0,
+        ["ACVoltage_R"] = acVr,
+        ["ACVoltage_S"] = acVs,
+        ["ACVoltage_T"] = acVt,
+        ["ACCurrent_R"] = 0,
+        ["ACCurrent_S"] = 0,
+        ["ACCurrent_T"] = 0,
+        ["OBC_ChargePortTemp1"] = -40,
+        ["OBC_ChargePortTemp2"] = -40
+    };
+    pduState["0x18FE50E5"] = obc2;
+
+    // JSON 브로드캐스트
+    string json = JsonSerializer.Serialize(pduState);
+    byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+
+    List<WebSocket> deadClients = new();
+    lock (wsLock)
+    {
+        foreach (var ws in wsClients)
         {
-            uint canId = kvp.Key;
-            byte[] d = kvp.Value;
-            string hex = BitConverter.ToString(d).Replace("-", " ");
-            string name = GetMessageName(canId);
-            int cnt = msgCount.ContainsKey(canId) ? msgCount[canId] : 0;
-
-            Console.WriteLine($"[0x{canId:X8}] {name}                    ");
-            Console.WriteLine($"  RAW: {hex}  (수신: {cnt}회)                    ");
-
-            switch (canId)
+            try
             {
-                // ── PDU_Status1 ──
-                case 0x18FFFF10:
-                    {
-                        int b1v = d[0] | (d[1] << 8);
-                        int b2v = d[2] | (d[3] << 8);
-                        int tv = d[4] | (d[5] << 8);
-                        Console.WriteLine($"  → Batt1_Voltage     = {b1v} V                    ");
-                        Console.WriteLine($"  → Batt2_Voltage     = {b2v} V                    ");
-                        Console.WriteLine($"  → TotalBatt_Voltage = {tv} V                    ");
-                        break;
-                    }
-
-                // ── PDU_Status2 ──
-                case 0x18FFFF20:
-                    {
-                        short b1a = (short)(d[0] | (d[1] << 8));
-                        short b2a = (short)(d[2] | (d[3] << 8));
-                        Console.WriteLine($"  → Batt1_Current = {b1a} A    Batt2_Current = {b2a} A                    ");
-                        Console.WriteLine($"  → BAT_S={Bit(d[4], 0)} PPC={Bit(d[4], 1)} PNC={Bit(d[4], 2)} PC={Bit(d[4], 3)} NC={Bit(d[4], 4)} PP={Bit(d[4], 5)} DC_P={Bit(d[4], 6)} DC_N={Bit(d[4], 7)}                    ");
-                        Console.WriteLine($"  → OBC={Bit(d[5], 0)} LDC={Bit(d[5], 1)} INV={Bit(d[5], 2)}                    ");
-                        break;
-                    }
-
-                // ── OBC_BMS_STATE1 ──
-                case 0x18FF50E5:
-                    {
-                        double chgV = (d[0] | (d[1] << 8)) * 0.1;
-                        double chgA = (d[2] | (d[3] << 8)) * 0.1;
-                        int obcTemp = (sbyte)d[5] - 40;
-                        Console.WriteLine($"  → ChargerVoltage = {chgV:F1} V    ChargerCurrent = {chgA:F1} A                    ");
-                        Console.WriteLine($"  → OBC_Temp = {obcTemp}℃    SW={d[6]} HW={d[7]}                    ");
-                        Console.WriteLine($"  → TempAnom={Bit(d[4], 0)} ACVoltAnom={Bit(d[4], 1)} Start1={Bit(d[4], 2)} ComOT={Bit(d[4], 3)}                    ");
-                        Console.WriteLine($"  → BattConn={Bit(d[4], 4)} Slave1={Bit(d[4], 5)} Slave2={Bit(d[4], 6)} Slave3={Bit(d[4], 7)}                    ");
-                        break;
-                    }
-
-                // ── OBC_BMS_STATE2 ──
-                case 0x18FE50E5:
-                    {
-                        Console.WriteLine($"  → AC_Voltage  R={d[0] * 2}V  S={d[1] * 2}V  T={d[2] * 2}V                    ");
-                        Console.WriteLine($"  → AC_Current  R={d[3]}A  S={d[4]}A  T={d[5]}A                    ");
-                        Console.WriteLine($"  → PortTemp1={(sbyte)d[6] - 40}℃  PortTemp2={d[7] - 40}℃                    ");
-                        break;
-                    }
-
-                // ── OBC_BMS_STATE3 ──
-                case 0x18FD50E5:
-                    {
-                        double maxCurr = (d[0] | (d[1] << 8)) * 0.1;
-                        double battV = (d[3] | (d[4] << 8)) * 0.1;
-                        Console.WriteLine($"  → MaxCurr={maxCurr:F1}A  CP_Duty={d[2]}%  BattV={battV:F1}V                    ");
-                        Console.WriteLine($"  → PP={Bit(d[5], 0)} CP={Bit(d[5], 1)} Lock={Bit(d[5], 2)} S2={Bit(d[5], 3)} Wake={Bit(d[5], 4)} PP_Res={(d[5] >> 5) & 0x07}                    ");
-                        Console.WriteLine($"  → PFC_Pos={d[6] * 2}V  PFC_Neg={d[7] * 2}V                    ");
-                        break;
-                    }
-
-                // ── OBC_BMS_STATE4 ──
-                case 0x18FC50E5:
-                    {
-                        Console.WriteLine($"  → Temp1={(sbyte)d[0] - 40}℃  Temp2={(sbyte)d[1] - 40}℃  Temp3={(sbyte)d[2] - 40}℃                    ");
-                        Console.WriteLine($"  → Vin: Uvp={Bit(d[3], 0)} Ovp={Bit(d[3], 1)} LineLoss={Bit(d[3], 2)} FreqFail={Bit(d[3], 3)} PhaseLoss={Bit(d[3], 4)}                    ");
-                        Console.WriteLine($"  → PFC_OC: R={Bit(d[3], 5)} S={Bit(d[3], 6)} T={Bit(d[3], 7)}                    ");
-                        Console.WriteLine($"  → Bus: Uvp={Bit(d[4], 0)} Ovp={Bit(d[4], 1)} Unbal={Bit(d[4], 2)} Short={Bit(d[4], 3)}                    ");
-                        Console.WriteLine($"  → Rly: Stick={Bit(d[4], 4)} Open={Bit(d[4], 5)} PfcTO={Bit(d[4], 6)} SCIFault={Bit(d[4], 7)}                    ");
-                        Console.WriteLine($"  → DC: HwOcp={Bit(d[5], 0)} OvPow={Bit(d[5], 1)} OutShort={Bit(d[5], 2)} Ocp5={Bit(d[5], 3)} CaliErr={Bit(d[5], 4)}                    ");
-                        Console.WriteLine($"  → OTP: Socket={Bit(d[5], 5)} PFC={Bit(d[5], 6)} M1={Bit(d[5], 7)} Air={Bit(d[6], 0)}                    ");
-                        Console.WriteLine($"  → SCI: Err1={Bit(d[6], 1)} Err2={Bit(d[6], 2)} VbatErr={Bit(d[6], 3)} VoutUvp={Bit(d[6], 4)} VoutOvp={Bit(d[6], 5)}                    ");
-                        Console.WriteLine($"  → Master={d[7] & 0x03} Slave1={(d[7] >> 2) & 0x03} Slave2={(d[7] >> 4) & 0x03} Slave3={(d[7] >> 6) & 0x03}                    ");
-                        break;
-                    }
-
-                // ── DCDC_VCU ──
-                case 0x1801E5F5:
-                    {
-                        double outCur = (d[3] | (d[4] << 8)) * 0.1;
-                        double outVol = d[5] * 0.2;
-                        int dcTemp = d[7] - 40;
-                        Console.WriteLine($"  → DC_Output_Vol = {outVol:F1} V    DC_Output_Cur = {outCur:F1} A                    ");
-                        Console.WriteLine($"  → DC_WorkStart = {Bit(d[6], 0)}    DC_Temp = {dcTemp}℃                    ");
-                        Console.WriteLine($"  → ERR: Temp={Bit(d[1], 0)} IOUTO={Bit(d[1], 1)} VOUTO={Bit(d[1], 2)} VOUTU={Bit(d[1], 3)} VINV={Bit(d[1], 4)} VINU={Bit(d[1], 5)} SHORT={Bit(d[1], 6)} HW={Bit(d[1], 7)} CAN_OT={Bit(d[2], 0)}                    ");
-                        break;
-                    }
-
-                // ── DCDC_VCU1 ──
-                case 0x1801E6F5:
-                    {
-                        int swVer = d[0] | (d[1] << 8);
-                        int hwVer = d[2] | (d[3] << 8);
-                        Console.WriteLine($"  → DCDC_SW_Version = {swVer}    DCDC_HW_Version = {hwVer}                    ");
-                        break;
-                    }
-
-                // ── 미정의 ──
-                default:
-                    {
-                        Console.WriteLine($"  → (파싱 미정의)                    ");
-                        break;
-                    }
+                if (ws.State == WebSocketState.Open)
+                    ws.SendAsync(jsonBytes, WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+                else
+                    deadClients.Add(ws);
             }
-            Console.WriteLine();
+            catch { deadClients.Add(ws); }
         }
-
-        Console.WriteLine("종료: Ctrl+C                    ");
+        foreach (var d in deadClients) wsClients.Remove(d);
     }
-
-    Thread.Sleep(1);
 }
-
-static string GetMessageName(uint id) => id switch
-{
-    0x18FFFF10 => "PDU_Status1 (배터리 전압)",
-    0x18FFFF20 => "PDU_Status2 (배터리 전류, 릴레이 접점상태)",
-    0x18FF50E5 => "OBC_BMS_STATE1 (OBC 상태)",
-    0x18FE50E5 => "OBC_BMS_STATE2 (AC 입력 확인용)",
-    0x18FD50E5 => "OBC_BMS_STATE3 (OBC 상태)",
-    0x18FC50E5 => "OBC_BMS_STATE4 (OBC 상태)",
-    0x1801E5F5 => "DCDC_VCU (LDC 상태)",
-    0x1801E6F5 => "DCDC_VCU1 (LDC 버전)",
-    _ => $"(알 수 없음 0x{id:X8})"
-};
-
-static int Bit(byte b, int pos) => (b >> pos) & 1;
